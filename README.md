@@ -170,9 +170,3 @@ Distributed Battery Management System (BMS) Simulation using Vector CANoe.
 
 
 **Mouheb Daoues**
-
-Embedded Systems Engineering Student
-
-Double Degree Student – ENSIL-ENSCI & ENISo
-
-Interested in Automotive Embedded Systems, Battery Management Systems, and Electric Vehicle Software.
