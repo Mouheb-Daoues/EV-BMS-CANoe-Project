@@ -138,46 +138,6 @@ EV_BMS_CANoe
 └── README.md
 ```
 
----
-
-# Technical Challenges Solved
-
-## 1. CAPL Physical Value Conversion Bug
-
-### Problem
-
-Signal values defined as physical values in the DBC were unexpectedly truncated due to an implicit float-to-integer conversion during assignment.
-
-### Solution
-
-The signal assignment process was redesigned to preserve floating-point precision and eliminate unintended truncation.
-
----
-
-## 2. Balancing State Machine Race Condition
-
-### Problem
-
-The balancing algorithm occasionally entered inconsistent states because multiple CAPL events were executed simultaneously.
-
-### Solution
-
-The balancing state machine was redesigned to ensure deterministic transitions and proper event synchronization.
-
----
-
-## 3. Distributed Balancing Architecture
-
-### Problem
-
-Managing balancing decisions across multiple simulated modules introduced synchronization and communication issues.
-
-### Solution
-
-A distributed coordination strategy was implemented, ensuring coherent balancing behavior across all ECUs.
-
----
-
 # Skills Demonstrated
 
 - Embedded Software Development
@@ -191,19 +151,6 @@ A distributed coordination strategy was implemented, ensuring coherent balancing
 - Debugging Complex Embedded Systems
 - Battery Management Systems
 - Electric Vehicle Software
-
----
-
-# Future Improvements
-
-- State of Health (SOH) estimation
-- Advanced SOC estimation (Kalman Filter)
-- Lithium-Ion battery model
-- UDS Diagnostics
-- Fault injection simulation
-- Simulink co-simulation
-- CAN FD support
-- AUTOSAR integration
 
 ---
 
@@ -221,39 +168,6 @@ June 2026
 
 Distributed Battery Management System (BMS) Simulation using Vector CANoe.
 
----
-
-# Screenshots
-
-Add screenshots of:
-
-- CANoe Simulation Setup
-- Network Architecture
-- CAN Messages
-- Panels
-- State Machine
-- Balancing Process
-
-Example:
-
-```
-/Images
-    CANoe_Network.png
-    Simulation.png
-    Balancing.png
-```
-
----
-
-# Disclaimer
-
-This repository is intended for educational and portfolio purposes.
-
-Some proprietary resources (CANoe configurations, DBC files, or company-specific assets) may not be included due to confidentiality agreements.
-
----
-
-## Author
 
 **Mouheb Daoues**
 
