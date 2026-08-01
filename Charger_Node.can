@@ -1,0 +1,199 @@
+/*@!Encoding:1252*/
+/*===========================================================================
+ * FICHIER    : Charger_Node.can
+ * ECU        : Charger
+ * BASE DBC   : BMS_CAN_Database.dbc
+ * DESCRIPTION: Simulation du chargeur embarque — protocoles AC/DC/FAST.
+ *              Recoit les consignes de BMS_Controller et simule la
+ *              montee en charge jusqu'a saturation.
+ *
+ * MESSAGES RECUS:
+ *   frmChargingControl    (ID: 0x109) depuis BMS_Controller — consignes
+ *   frmBMSStateEstimation (ID: 0x103) depuis BMS_Controller — SOC actuel
+ *   frmSafetyBus          (ID: 0x105) depuis BMS_Controller — inhibitions
+ *===========================================================================*/
+
+includes {}
+
+variables
+{
+  /* -- Timer principal du chargeur --------------------------------------- */
+  mstimer tChargerCycle;   /* cycle de simulation interne : 200ms */
+
+  /* -- Consignes recues de BMS_Controller ------------------------------- */
+  float maxVoltageCmd;     /* tension max autorisee (V)             */
+  float maxCurrentCmd;     /* courant max autorise (A)              */
+  float termVoltage;       /* tension d'arret de charge (V)         */
+  int   chargeMode;        /* 0=NONE 1=AC 2=DC 3=FAST              */
+
+  /* -- Etat interne chargeur -------------------------------------------- */
+  float actualVoltage;     /* tension reellement appliquee (V)      */
+  float actualCurrent;     /* courant reellement injecte (A)        */
+  int   chargingPhase;     /* 0=Idle 1=CC (courant constant) 2=CV (tension constante) 3=Done */
+
+  /* -- SOC et securite recus -------------------------------------------- */
+  float socCurrent;        /* SOC en % recu de BMS_Controller       */
+  int   chargeInhibit;     /* 1 = charge interdite (securite)       */
+
+  /* -- Statistiques session --------------------------------------------- */
+  int   chargeSessionCount;
+  float energyDelivered;   /* kWh delivres durant la session        */
+  int   chargeCycles;
+}
+
+on start
+{
+  write("============================================================");
+  write("[CHARGER] Demarrage — Gestion de la recharge batterie");
+  write("============================================================");
+
+  maxVoltageCmd = 420.0;
+  maxCurrentCmd = 32.0;
+  termVoltage   = 418.5;
+  chargeMode    = 0;       /* NONE — pas branche */
+
+  actualVoltage = 0.0;
+  actualCurrent = 0.0;
+  chargingPhase = 0;       /* Idle */
+
+  socCurrent   = 80.0;
+  chargeInhibit = 0;
+
+  chargeSessionCount = 0;
+  energyDelivered    = 0.0;
+  chargeCycles       = 0;
+
+  setTimer(tChargerCycle, 200);
+  write("[CHARGER] Pret — en attente de connexion (sigPlugStatus)");
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmChargingControl  (ID: 0x109)
+ * Mise a jour des consignes de charge depuis BMS_Controller
+ *---------------------------------------------------------------------------*/
+on message frmChargingControl
+{
+  int prevMode;
+  prevMode   = chargeMode;
+
+  maxVoltageCmd = this.sigMaxChargeVoltage;
+  maxCurrentCmd = this.sigMaxChargeCurrent;
+  termVoltage   = this.sigChargeTerminationVoltage;
+  chargeMode    = this.sigChargeModeRequest;
+
+  /* Demarrage d'une nouvelle session si mode change de NONE vers actif */
+  if (prevMode == 0 && chargeMode > 0 && !chargeInhibit) {
+    chargingPhase = 1;  /* Phase CC */
+    chargeSessionCount++;
+    energyDelivered = 0.0;
+    write("[CHARGER] Session de charge #%d demarree — Mode=%d | Vmax=%.1fV | Imax=%.1fA",
+          chargeSessionCount, chargeMode, maxVoltageCmd, maxCurrentCmd);
+  }
+
+  /* Arret si mode revient a NONE */
+  if (chargeMode == 0) {
+    chargingPhase = 0;  /* Idle */
+    actualCurrent = 0.0;
+    write("[CHARGER] Recharge arretee par BMS_Controller");
+  }
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmBMSStateEstimation  (ID: 0x103)
+ * Mise a jour du SOC actuel
+ *---------------------------------------------------------------------------*/
+on message frmBMSStateEstimation
+{
+  socCurrent = this.sigSOC;
+
+  /* Detection SOC 100% : arret de charge */
+  if (socCurrent >= 100.0 && chargingPhase > 0) {
+    chargingPhase = 3;  /* Done */
+    actualCurrent = 0.0;
+    write("[CHARGER] SOC 100%% atteint — session terminee | Energie delivree : %.2f kWh",
+          energyDelivered);
+  }
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmSafetyBus  (ID: 0x105)
+ * Inhibition de charge par le BMS_Controller
+ *---------------------------------------------------------------------------*/
+on message frmSafetyBus
+{
+  int prevInhibit;
+  prevInhibit   = chargeInhibit;
+  chargeInhibit = this.sigChargeInhibit;
+
+  if (chargeInhibit && !prevInhibit) {
+    actualCurrent = 0.0;
+    chargingPhase = 0;
+    write("[CHARGER] CHARGE INHIBEE par BMS — arret immediat");
+  }
+  else if (!chargeInhibit && prevInhibit) {
+    write("[CHARGER] Inhibition levee — reprise possible");
+    if (chargeMode > 0) chargingPhase = 1;
+  }
+}
+
+/*---------------------------------------------------------------------------
+ * TIMER 200ms — Cycle de simulation du protocole CC/CV
+ *---------------------------------------------------------------------------*/
+on timer tChargerCycle
+{
+  chargeCycles++;
+
+  if (chargeInhibit || chargeMode == 0 || chargingPhase == 0 || chargingPhase == 3) {
+    /* Aucune charge active */
+    actualCurrent = 0.0;
+    actualVoltage = 0.0;
+  }
+  else if (chargingPhase == 1) {
+    /* -- Phase CC : courant constant ------------------------------- */
+    /* Le courant reste constant a la valeur max autorisee             */
+    actualCurrent = maxCurrentCmd;
+
+    /* Tension augmente progressivement */
+    actualVoltage += (maxCurrentCmd * 0.002);
+    if (actualVoltage > maxVoltageCmd) actualVoltage = maxVoltageCmd;
+
+    /* Energie accumulee (I*V*dt en kWh, dt=0.2s) */
+    energyDelivered += (actualCurrent * actualVoltage * 0.2) / 3600000.0;
+
+    /* Passage en phase CV quand tension atteint la cible */
+    if (actualVoltage >= termVoltage) {
+      chargingPhase = 2;
+      write("[CHARGER] Passage CC -> CV | V=%.1fV", actualVoltage);
+    }
+  }
+  else if (chargingPhase == 2) {
+    /* -- Phase CV : tension constante ------------------------------ */
+    /* La tension est maintenue, le courant diminue progressivement   */
+    actualVoltage  = termVoltage;
+    actualCurrent *= 0.98;  /* decroissance exponentielle */
+
+    energyDelivered += (actualCurrent * actualVoltage * 0.2) / 3600000.0;
+
+    /* Fin de charge quand courant < 10% du max */
+    if (actualCurrent < (maxCurrentCmd * 0.10)) {
+      chargingPhase = 3;
+      actualCurrent = 0.0;
+      write("[CHARGER] Phase CV terminee — batterie chargee | Energie=%.2f kWh",
+            energyDelivered);
+    }
+  }
+
+  /* Log toutes les 5 secondes */
+  if ((chargeCycles % 25) == 0 && chargingPhase > 0 && chargingPhase < 3) {
+    write("[CHARGER] Phase=%d | V=%.1fV | I=%.1fA | SOC=%.0f%% | Energie=%.3f kWh",
+          chargingPhase, actualVoltage, actualCurrent, socCurrent, energyDelivered);
+  }
+
+  setTimer(tChargerCycle, 200);
+}
+
+on stopMeasurement
+{
+  write("[CHARGER] Arret — %d sessions | Energie totale delivree : %.2f kWh",
+        chargeSessionCount, energyDelivered);
+}

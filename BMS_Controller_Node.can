@@ -1,0 +1,536 @@
+﻿/*@!Encoding:65001*/
+/*=========================================================
+  BMS_Controller.can
+  ECU : BMS_Controller
+=========================================================*/
+
+variables
+{
+  msTimer t10ms;
+  msTimer t20ms;
+  msTimer t50ms;
+  msTimer t100ms;
+
+  float soc = 80.0;
+  float soh = 96.0;
+
+  float packVoltage = 387.5;
+  float packCurrent = 0.0;
+
+  float packTempAvg = 28.0;
+  float packTempMax = 30.0;
+
+  float cellVoltageMin = 3.58;
+  float cellVoltageMax = 3.62;
+
+  float sopDischarge = 120.0;
+  float sopCharge = 150.0;
+  
+  float allowedDischargeCurrent;   /* A — courant max de décharge autorisé */
+  float allowedChargeCurrent;      /* A — courant max de charge autorisé   */
+
+  int chargingActive = 0;
+  int plugStatus = 0;
+
+  int dischargeInhibit = 0;
+  int chargeInhibit = 0;
+
+  int safeState = 1;
+
+  int overTempFault = 0;
+  int underTempFault = 0;
+  int overVoltageFault = 0;
+  int underVoltageFault = 0;
+  int shortCircuitFault = 0;
+  int overCurrentFault = 0;
+  int insulationFault = 0;
+
+  int operatingCommand = 1;
+}
+
+/*=========================================================
+  STARTUP
+=========================================================*/
+on start
+{
+  write("=== BMS_Controller Started ===");
+
+  /* Initialisation par défaut de vos variables système au démarrage */
+  @sysvar::BMS::CoolingFanReq = 0;
+  @sysvar::BMS::PumpSpeedReq = 20;
+
+  setTimer(t10ms,10);
+  setTimer(t20ms,20);
+  setTimer(t50ms,50);
+  setTimer(t100ms,100);
+}
+
+/*=========================================================
+  10 ms TASK
+=========================================================*/
+on timer t10ms
+{
+  sendPackMeasurements();
+  sendBMSStateEstimation();
+  sendSafetyBus();
+  sendContactorControl();
+
+  setTimer(t10ms,10);
+}
+
+/*=========================================================
+  20 ms TASK
+=========================================================*/
+on timer t20ms
+{
+  sendFaultStatus();
+  sendThermalControl();
+  sendChargingControl();
+
+  setTimer(t20ms,20);
+}
+
+/*=========================================================
+  50 ms TASK
+=========================================================*/
+on timer t50ms
+{
+  sendCellMonitoring();
+  sendChargingStatus();
+
+  setTimer(t50ms,50);
+}
+
+/*=========================================================
+  100 ms TASK
+=========================================================*/
+on timer t100ms
+{
+  updateSOCandSOP();
+  evaluateFaults();
+
+  setTimer(t100ms,100);
+}
+
+/*=========================================================
+  SOC / SOH
+=========================================================*/
+void updateSOCandSOP()
+{
+  /* ── Lecture SOC depuis System Variable ── */
+  soc = @sysvar::BMS::SOC;
+
+  /* ══════════════════════════════════════════════════════
+   * CALCUL allowedDischargeCurrent
+   * Priorité décroissante : défauts > SOC > SOH > Temp
+   * ══════════════════════════════════════════════════════ */
+
+  /* Blocage total : défaut critique ou SOC nul */
+  if (soc <= 0.0                             ||
+      dischargeInhibit == 1                  ||
+      @sysvar::Faults::ShortCircuitActive == 1 ||
+      @sysvar::Faults::InsulationActive   == 1 ||
+      packTempMax >= 60.0)
+  {
+    allowedDischargeCurrent = 0.0;
+  }
+
+  /* SOC très bas : limitation sévère */
+  else if (soc < 5.0)
+  {
+    /* Rampe linéaire 0 A → 50 A entre SOC 0% et 5% */
+    allowedDischargeCurrent = 50.0 * (soc / 5.0);
+  }
+
+  /* SOC bas : limitation modérée */
+  else if (soc < 10.0) { allowedDischargeCurrent = 50.0;  }
+  else if (soc < 20.0) { allowedDischargeCurrent = 100.0; }
+
+  /* Surchauffe modérée : bride le courant */
+  else if (packTempMax >= 45.0)
+  {
+    allowedDischargeCurrent = 100.0;
+  }
+
+  /* SOH dégradé : limitation proportionnelle */
+  else if (soh < 80.0)
+  {
+    allowedDischargeCurrent = 300.0 * (soh / 100.0);
+  }
+
+  /* Conditions nominales */
+  else
+  {
+    allowedDischargeCurrent = 300.0;
+  }
+
+  /* ══════════════════════════════════════════════════════
+   * CALCUL allowedChargeCurrent
+   * ══════════════════════════════════════════════════════ */
+
+  /* Blocage total : défaut critique ou SOC plein */
+  if (soc >= 100.0                           ||
+      chargeInhibit == 1                     ||
+      @sysvar::Faults::ShortCircuitActive == 1 ||
+      @sysvar::Faults::InsulationActive   == 1 ||
+      packTempMax >= 60.0)
+  {
+    allowedChargeCurrent = 0.0;
+  }
+
+  /* Approche pleine charge : limitation progressive */
+  else if (soc > 90.0)
+  {
+    /* Rampe linéaire 150 A → 0 A entre SOC 90% et 100% */
+    allowedChargeCurrent = 150.0 * ((100.0 - soc) / 10.0);
+  }
+
+  /* Surchauffe modérée */
+  else if (packTempMax >= 45.0)
+  {
+    allowedChargeCurrent = 50.0;
+  }
+
+  /* SOH dégradé */
+  else if (soh < 80.0)
+  {
+    allowedChargeCurrent = 150.0 * (soh / 100.0);
+  }
+
+  /* Conditions nominales */
+  else
+  {
+    allowedChargeCurrent = 150.0;
+  }
+
+  /* ══════════════════════════════════════════════════════
+   * CALCUL SOP = U × I_max / 1000  [kW]
+   * DBC : sigSOPDischarge [0|200] kW, facteur 1, offset 0
+   *       sigSOPCharge    [0|200] kW, facteur 1, offset 0
+   * ══════════════════════════════════════════════════════ */
+  sopDischarge = (packVoltage * allowedDischargeCurrent) / 1000.0;
+  sopCharge    = (packVoltage * allowedChargeCurrent)    / 1000.0;
+
+  /* Bornage selon plage DBC [0|200] kW */
+  if (sopDischarge < 0.0)   sopDischarge = 0.0;
+  if (sopDischarge > 200.0) sopDischarge = 200.0;
+  if (sopCharge    < 0.0)   sopCharge    = 0.0;
+  if (sopCharge    > 200.0) sopCharge    = 200.0;
+
+  /* Publication vers panel */
+  @sysvar::BMS::SOPDischarge = sopDischarge;
+  @sysvar::BMS::SOC          = soc;
+  @sysvar::BMS::SOPCharge    = sopCharge;
+
+  write("[BMS_CTRL] SOC=%.1f%% SOH=%.1f%% T=%.1fC | "
+        "I_dis=%.0fA I_chg=%.0fA | SOP_dis=%.1fkW SOP_chg=%.1fkW",
+        soc, soh, packTempMax,
+        allowedDischargeCurrent, allowedChargeCurrent,
+        sopDischarge, sopCharge);
+}
+/*=========================================================
+  FAULT MANAGEMENT
+=========================================================*/
+void evaluateFaults()
+{
+  overTempFault = 0;
+  underTempFault = 0;
+  overVoltageFault = 0;
+  underVoltageFault = 0;
+  shortCircuitFault = 0;
+  overCurrentFault = 0;
+  insulationFault = 0;
+
+  dischargeInhibit = 0;
+  chargeInhibit = 0;
+
+  if(packTempMax >= 45)
+  {
+    overTempFault = 1;
+    dischargeInhibit = 1;
+  }
+  if(packTempMax >= 60)
+{
+  dischargeInhibit = 1;
+  chargeInhibit = 1;
+}
+
+  if(packTempAvg <= -10)
+  {
+    underTempFault = 1;
+  }
+
+  if(packVoltage > 420)
+  {
+    overVoltageFault = 1;
+    chargeInhibit = 1;
+  }
+
+  if(packVoltage < 300 || @sysvar::Faults::UnderVoltageActive)
+{
+    underVoltageFault = 1;
+    dischargeInhibit = 1;
+}
+
+  if(packCurrent > 350 || packCurrent < -400)
+{
+  overCurrentFault = 1;
+  dischargeInhibit = 1;
+}
+if(@sysvar::Faults::ShortCircuitActive)
+  {
+    shortCircuitFault = 1;
+
+    dischargeInhibit = 1;
+    chargeInhibit    = 1;
+
+    safeState = 0;
+  }
+}
+
+/*=========================================================
+  THERMAL LOGIC (Modifiée avec les variables système)
+=========================================================*/
+void thermalControlLogic()
+{
+  int fan;
+  int pump;
+
+  /* Chauffage batterie */
+  if(packTempMax < 0.0)
+  {
+    fan = 0;
+    pump = 50;   // circulation du liquide
+    @sysvar::Thermal::Mode = 2;   // HEATING
+  }
+
+  /* Température normale basse */
+  else if(packTempMax <= 20.0)
+  {
+    fan = 0;
+    pump = 20;
+    @sysvar::Thermal::Mode = 0;   // Standby
+  }
+
+  /* Refroidissement maximal */
+  else if(packTempMax >= 50.0)
+  {
+    fan = 100;
+    pump = 100;
+    @sysvar::Thermal::Mode = 1;   // COOLING
+  }
+
+  /* Refroidissement progressif */
+  else
+  {
+    fan  = (int)((packTempMax - 20.0) * 100.0 / 30.0);
+    pump = 20 + (int)((packTempMax - 20.0) * 80.0 / 30.0);
+
+    @sysvar::Thermal::Mode = 1;   // COOLING
+  }
+
+  @sysvar::BMS::CoolingFanReq = fan;
+  @sysvar::BMS::PumpSpeedReq  = pump;
+
+  write("Temp=%.1f -> Fan=%d%% Pump=%d%% Mode=%d",
+        packTempMax,
+        fan,
+        pump,
+        @sysvar::Thermal::Mode);
+}
+
+/*=========================================================
+  TEMPERATURE SLIDER PANEL
+=========================================================*/
+
+on sysvar Scenario::InjectTemp
+{
+  packTempMax = @sysvar::Scenario::InjectTemp;
+
+  write("Nouvelle température = %.1f", packTempMax);
+
+  thermalControlLogic();
+}
+
+/*=========================================================
+  frmPackMeasurements
+=========================================================*/
+void sendPackMeasurements()
+{
+  message frmPackMeasurements msg;
+
+  packVoltage = @sysvar::BMS::PackVoltage;
+  packCurrent = @sysvar::BMS::PackCurrent;
+
+  msg.sigPackVoltage = (int)(packVoltage / 0.1);
+  msg.sigPackCurrent = (int)(packCurrent / 0.1);
+  msg.sigPackTempAvg = (int)(packTempAvg + 40.0);
+  msg.sigPackTempMax = (int)(packTempMax + 40.0);
+
+  output(msg);
+}
+
+/*=========================================================
+  frmCellMonitoring
+=========================================================*/
+void sendCellMonitoring()
+{
+  message frmCellMonitoring msg;
+  msg.sigCellVoltageMax = cellVoltageMax;
+  msg.sigCellVoltageMin = cellVoltageMin;
+  msg.sigCellTempMax = packTempMax;
+  msg.sigCellTempMin = packTempAvg;
+  output(msg);
+}
+
+/*=========================================================
+  frmBMSStateEstimation
+=========================================================*/
+void sendBMSStateEstimation()
+{
+  message frmBMSStateEstimation msg;
+
+  msg.sigSOC          = (int)soc;
+  msg.sigSOH          = (int)soh;
+
+  /* SOP = puissance MAX autorisée — PAS la puissance instantanée */
+  msg.sigSOPDischarge = (int)sopDischarge;
+  msg.sigSOPCharge    = (int)sopCharge;
+
+  output(msg);
+}
+
+/*=========================================================
+  frmSafetyBus
+=========================================================*/
+void sendSafetyBus()
+{
+  message frmSafetyBus msg;
+  msg.sigSafeStateActive = @sysvar::BMS::SafeStateActive;
+  msg.sigDischargeInhibit = dischargeInhibit;
+  msg.sigChargeInhibit = chargeInhibit;
+  msg.sigOperatingCommand = operatingCommand;
+  output(msg);
+}
+
+/*=========================================================
+  frmContactorControl
+=========================================================*/
+void sendContactorControl()
+{
+  message frmContactorControl msg;
+  msg.sigContactorCmdRequest = 1;
+  msg.sigMainContactorState = 1;
+  msg.sigPrechargeState = 1;
+  output(msg);
+}
+
+/*=========================================================
+  frmFaultStatus
+=========================================================*/
+void sendFaultStatus()
+{
+  message frmFaultStatus msg;
+  msg.sigOvervoltageFault = overVoltageFault;
+  msg.sigUndervoltageFault = underVoltageFault;
+  msg.sigShortCircuitFault = shortCircuitFault;
+  msg.sigOvercurrentFault = overCurrentFault;
+  msg.sigOverTempFault = overTempFault;
+  msg.sigUnderTempFault = underTempFault;
+  msg.sigInsulationFault = insulationFault;
+  
+  output(msg);
+}
+
+/*=========================================================
+  frmThermalControl (Modifiée avec les variables système)
+=========================================================*/
+void sendThermalControl()
+{
+  message frmThermalControl msg;
+
+  /* Appelle la logique qui met à jour les @sysvar */
+  
+
+  /* On affecte les signaux de la trame CAN à partir des variables système */
+  msg.sigCoolingFanReq = @sysvar::BMS::CoolingFanReq;
+  msg.sigPumpSpeedReq = @sysvar::BMS::PumpSpeedReq;
+
+  msg.sigThermalModeFeedback = @sysvar::Thermal::Mode;
+  msg.sigActualTemperature = packTempMax;
+
+  output(msg);
+  write("[TX THERMAL] Temp=%.1f Fan=%d Pump=%d Mode=%d",
+      packTempMax,
+      @sysvar::BMS::CoolingFanReq,
+      @sysvar::BMS::PumpSpeedReq,
+      @sysvar::Thermal::Mode);
+}
+
+/*=========================================================
+  frmChargingControl
+=========================================================*/
+void sendChargingControl()
+{
+  message frmChargingControl msg;
+  msg.sigMaxChargeVoltage = 420;
+  msg.sigMaxChargeCurrent = 32;
+  msg.sigChargeTerminationVoltage = 418;
+
+  if(chargingActive){
+     msg.sigChargeModeRequest = 1;
+  }
+  else
+     msg.sigChargeModeRequest = 0;
+
+  output(msg);
+}
+
+/*=========================================================
+  frmChargingStatus
+=========================================================*/
+void sendChargingStatus()
+{
+  message frmChargingStatus msg;
+  msg.sigPlugStatus = plugStatus;
+  msg.sigChargingActive = chargingActive;
+
+  if(soc >= 100){
+     msg.sigChargeComplete = 1;
+  }
+  else
+     msg.sigChargeComplete = 0;
+
+  output(msg);
+}
+
+
+
+/*=========================================================
+  KEYBOARD EVENTS
+=========================================================*/
+on key 'c'
+{
+  chargingActive = 1;
+  plugStatus = 1;
+  write("[BMS] Charge AC demarree");
+}
+
+on key 'u'
+{
+  chargingActive = 0;
+  plugStatus = 0;
+  write("[BMS] Charge arretee");
+}
+
+on key 'h'
+{
+  packTempMax = 47;
+  write("[BMS] Surchauffe injectee");
+}
+
+on key 'n'
+{
+  packTempMax = 28;
+  write("[BMS] Temperature normale");
+}

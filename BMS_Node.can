@@ -1,0 +1,607 @@
+﻿/*@!Encoding:65001*/
+/*===========================================================================
+ * FICHIER     : BMS_Node.can
+ * ECU         : BMS (Battery Management System)
+ * BASE DBC    : PowerTrain.dbc
+ *
+ * 
+ *===========================================================================*/
+
+includes {}
+
+variables
+{
+  mstimer tBPC;
+  mstimer tBattState;
+  mstimer tCurrentLimit;
+  mstimer tEnergy;
+  mstimer tPanelUpdate;
+
+  float cellVoltMin[16];
+  float cellVoltMax[16];
+  float cellPackVolt[16];
+  float voltagePerModule;
+
+  int   batteryState;
+  float batteryVoltage;
+  float packCurrent;
+  float lowestCellVoltage;
+  float packTempMax;
+  float deltaEnergy;
+
+  int   alertAnyShortcut;
+  int   alertAnyUnbalanced;
+  int   alertAnyLowVoltage;
+  int   alertAnyBypassed;
+
+  int   drainLimit;
+  int   chargeLimit;
+
+  float remainingEnergy;
+  float remainingCapacity;
+  float maxEnergyNominal;
+  float soc;
+  float soh;
+
+  int   bypassActive[16];
+  int   balanceActive[16];
+  float targetVoltage;
+
+  int   cycleCount;
+}
+
+/*---------------------------------------------------------------------------
+ * DEMARRAGE
+ *---------------------------------------------------------------------------*/
+on start
+{
+  int i;
+
+  write("============================================================");
+  write("[BMS] Demarrage — Initialisation & Couplage System Variables");
+  write("============================================================");
+
+  for (i = 0; i < 16; i++) {
+    cellVoltMin[i]  = 3.60;
+    cellVoltMax[i]  = 3.62;
+    cellPackVolt[i] = 3.61 * 22.0;
+    bypassActive[i]  = 0;
+    balanceActive[i] = 0;
+  }
+
+  batteryState      = 5;
+  packCurrent       = 0.0;
+  lowestCellVoltage = 3.60;
+  packTempMax       = 25.0;
+  soh               = 96.0;
+
+  alertAnyShortcut   = 0;
+  alertAnyUnbalanced = 0;
+  alertAnyLowVoltage = 0;
+  alertAnyBypassed   = 0;
+
+  drainLimit  = -400;
+  chargeLimit = 200;
+
+  remainingEnergy   = 85.0;
+  remainingCapacity = 95.0;
+  maxEnergyNominal  = 112.0;
+
+  soc           = (remainingEnergy / maxEnergyNominal) * 100.0;
+  if (soc > 100.0) soc = 100.0;
+  if (soc <   0.0) soc = 0.0;
+  batteryVoltage = 300.0 + (soc * 1.2);
+
+  deltaEnergy   = 0.0;
+  targetVoltage = 3.65;
+  cycleCount    = 0;
+
+  @sysvar::BMS::SOC               = soc;
+  @sysvar::BMS::SOH               = soh;
+  @sysvar::BMS::PackVoltage       = batteryVoltage;
+  @sysvar::BMS::PackCurrent       = packCurrent;
+  @sysvar::BMS::PackTempMax       = packTempMax;
+  @sysvar::BMS::BatteryState      = batteryState;
+  @sysvar::BMS::SafeStateActive   = 1;
+  @sysvar::BMS::DischargeInhibit  = 0;
+  @sysvar::BMS::ChargeInhibit     = 0;
+  @sysvar::BMS::MainContactorState = 1;
+  @sysvar::BMS::CoolingFanReq     = 50;
+  @sysvar::BMS::PumpSpeedReq      = 50;
+
+  @sysvar::Thermal::Mode = 3;
+
+  @sysvar::Scenario::InjectTemp     = 25.0;
+  @sysvar::Scenario::InjectSOC      = soc;
+  @sysvar::Scenario::ForceImbalance = -1;
+
+  setTimer(tBPC, 100);
+  setTimer(tBattState, 200);
+  setTimer(tCurrentLimit, 250);
+  setTimer(tEnergy, 250);
+  setTimer(tPanelUpdate, 100);
+
+  write("[BMS] Tout est synchronise. Pret pour l'interaction Panel.");
+}
+
+/*---------------------------------------------------------------------------
+ * BOUCLE DE SIMULATION DYNAMIQUE (100 ms)
+ *---------------------------------------------------------------------------*/
+on timer tBPC
+{
+  int   i, idx;
+  float vMin, vMax, vPack, ecart;
+  int   alertUnbal, alertLowV, alertHighV, alertShortcut;
+  int   alertHighT, alertLowT, alertBypass;
+
+  cycleCount++;
+
+  /* ══════════════════════════════════════════════════════════════
+   * ÉTAPE 1 — Scénario : charge ou décharge
+   * ══════════════════════════════════════════════════════════════ */
+  if (@sysvar::Scenario::PlugCharger == 1) {
+    if (@sysvar::Faults::ShortCircuitActive == 1 ||
+        @sysvar::Faults::InsulationActive   == 1 ||
+        packTempMax >= 60.0) {
+      packCurrent = 0.0;
+      @sysvar::Scenario::PlugCharger = 0;
+      write("[BMS] Charge interrompue : defaut critique");
+    }
+    else if (packTempMax >= 45.0) {
+      packCurrent = 20.0;
+      write("[BMS] Charge limitee a 20A (temperature elevee)");
+    }
+    else if (packTempMax >= 35.0) { packCurrent = 50.0;  }
+    else                          { packCurrent = 100.0; }
+
+    for (i = 0; i < 16; i++) {
+      if (bypassActive[i] == 0) {
+        cellVoltMin[i]  += 0.0001;
+        cellVoltMax[i]  += 0.0001;
+        cellPackVolt[i] += 0.0022;
+      }
+    }
+  }
+  else if (@sysvar::Scenario::StartVehicle == 1) {
+    packCurrent = -200.0;
+    for (i = 0; i < 16; i++) {
+      if (bypassActive[i] == 0) {
+        cellVoltMin[i]  -= 0.0001;
+        cellVoltMax[i]  -= 0.0001;
+        cellPackVolt[i] -= 0.0022;
+      }
+    }
+  }
+  else {
+    packCurrent = 0.0;
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   * ÉTAPE 2 — Injections panel
+   * ══════════════════════════════════════════════════════════════ */
+  
+
+  if (@sysvar::Faults::InjectUnderVoltage == 1) {
+    cellVoltMin[0]     = 2.80;
+    remainingEnergy   *= 0.75;
+    remainingCapacity *= 0.75;
+    @sysvar::Faults::UnderVoltageActive = 1;
+  }
+  if (@sysvar::Faults::InjectShortCircuit == 1) {
+    cellVoltMin[1]     = 0.30;
+    remainingEnergy   -= 0.05;
+    remainingCapacity -= 0.05;
+    @sysvar::Faults::ShortCircuitActive = 1;
+    @sysvar::BMS::SafeStateActive   = 0;
+    @sysvar::BMS::DischargeInhibit  = 1;
+    @sysvar::BMS::ChargeInhibit     = 1;
+  }
+  if (@sysvar::Faults::InjectOverCurrent == 1) {
+    packCurrent = -500.0;
+    @sysvar::Faults::OverCurrentActive = 1;
+  }
+
+/* ══════════════════════════════════════════════════════════════
+   * ÉTAPE 3 — Balancing (convergence exponentielle)
+   * ══════════════════════════════════════════════════════════════ */
+  for (i = 0; i < 16; i++) {
+    if (balanceActive[i]) {
+      /* FIX 1 : On utilise la cible spécifique calculée par le BATTDOC pour ce module */
+      cellVoltMin[i] += (targetVoltage - cellVoltMin[i]) * 0.05;
+      cellVoltMax[i] -= (cellVoltMax[i] - targetVoltage) * 0.05;
+
+      /* FIX 2 : Suppression du "if ((cellVoltMax[i] - cellVoltMin[i]) <= 0.08)"
+       * C'est désormais uniquement BATTDOC (via le message frmMaintenance) 
+       * qui décidera d'arrêter le balancing en passant balanceActive[i] à 0. */
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   * ÉTAPE 4 — Emission des 16 trames frmStateBPC + frmAlarmsBPC
+   * ══════════════════════════════════════════════════════════════ */
+  for (i = 0; i < 16; i++) {
+    vMin  = (float)cellVoltMin[i];
+    vMax  = (float)cellVoltMax[i];
+    vPack = (float)cellPackVolt[i];
+    ecart = vMax - vMin;
+
+    alertUnbal    = (ecart > 0.10) ? 1 : 0;
+    alertLowV     = (vMin  < 3.00) ? 1 : 0;
+    alertHighV    = (vMax  > 4.20) ? 1 : 0;
+    alertShortcut = (vMin  < 0.50) ? 1 : 0;
+    alertHighT    = (@sysvar::Faults::OverTempActive == 1) ? 1 : 0;
+    alertLowT     = 0;
+    alertBypass   = bypassActive[i];
+
+    /* --- FIX : Utilisation de .phys pour forcer la conversion DBC correcte --- */
+    switch (i) {
+      case  0:{message frmStateBPC_00 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  1:{message frmStateBPC_01 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  2:{message frmStateBPC_02 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  3:{message frmStateBPC_03 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  4:{message frmStateBPC_04 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  5:{message frmStateBPC_05 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  6:{message frmStateBPC_06 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  7:{message frmStateBPC_07 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  8:{message frmStateBPC_08 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case  9:{message frmStateBPC_09 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 10:{message frmStateBPC_10 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 11:{message frmStateBPC_11 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 12:{message frmStateBPC_12 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 13:{message frmStateBPC_13 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 14:{message frmStateBPC_14 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+      case 15:{message frmStateBPC_15 m; m.sigCellVoltageMin.phys=vMin; m.sigCellVoltageMax.phys=vMax; m.sigCellPackVoltage.phys=vPack; output(m);}break;
+    }
+
+    /* Note : Pas besoin de .phys pour les alarmes car ce sont des booléens bruts (0 ou 1) sans facteur */
+    switch (i) {
+      case  0:{message frmAlarmsBPC_00 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  1:{message frmAlarmsBPC_01 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  2:{message frmAlarmsBPC_02 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  3:{message frmAlarmsBPC_03 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  4:{message frmAlarmsBPC_04 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  5:{message frmAlarmsBPC_05 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  6:{message frmAlarmsBPC_06 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  7:{message frmAlarmsBPC_07 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  8:{message frmAlarmsBPC_08 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case  9:{message frmAlarmsBPC_09 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 10:{message frmAlarmsBPC_10 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 11:{message frmAlarmsBPC_11 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 12:{message frmAlarmsBPC_12 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 13:{message frmAlarmsBPC_13 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 14:{message frmAlarmsBPC_14 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+      case 15:{message frmAlarmsBPC_15 a;a.sigAlertUnbalanced=alertUnbal;a.sigAlertLowVoltage=alertLowV;a.sigAlertHighVoltage=alertHighV;a.sigAlertShortcut=alertShortcut;a.sigAlertHighTemperature=alertHighT;a.sigAlertLowTemperature=alertLowT;a.sigAlertBypassed=alertBypass;output(a);}break;
+    }
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+   * ÉTAPE 5 — Synthèse des alertes globales
+   * ══════════════════════════════════════════════════════════════ */
+  {
+    int prevUnbalanced;
+    prevUnbalanced = alertAnyUnbalanced;
+
+    alertAnyUnbalanced = 0;
+    alertAnyLowVoltage = 0;
+    alertAnyBypassed   = 0;
+    alertAnyShortcut   = 0;
+    lowestCellVoltage  = 99.0;
+
+    for (i = 0; i < 16; i++) {
+      float delta;
+      delta = cellVoltMax[i] - cellVoltMin[i];
+      if (delta > 0.10) {
+        alertAnyUnbalanced = 1;
+        write("[BMS] DESEQUILIBRE BPC_%02d Delta=%.3fV", i, delta);
+      }
+      if (cellVoltMin[i] < 3.00) alertAnyLowVoltage = 1;
+      if (cellVoltMin[i] < 0.50) alertAnyShortcut   = 1;
+      if (bypassActive[i])       alertAnyBypassed   = 1;
+      if (cellVoltMin[i] < lowestCellVoltage)
+        lowestCellVoltage = cellVoltMin[i];
+    }
+
+    if (alertAnyUnbalanced != prevUnbalanced) {
+      if (alertAnyUnbalanced == 0)
+        write("[BMS] Desequilibre resolu — alertAnyUnbalanced=0");
+      else
+        write("[BMS] Desequilibre detecte — alertAnyUnbalanced=1");
+    }
+
+    @sysvar::Faults::Unbalance = alertAnyUnbalanced;
+
+  }
+
+  setTimer(tBPC, 100);
+}
+
+/*---------------------------------------------------------------------------
+ * ENVOI DU STATUT GLOBAL ET STRATEGIE SECURITE (200 ms)
+ *---------------------------------------------------------------------------*/
+on timer tBattState
+{
+  message frmBatteryState msg;
+
+  if (alertAnyShortcut == 1 || @sysvar::Faults::ShortCircuitActive == 1 || @sysvar::Faults::InsulationActive == 1) {
+    batteryState = 2;
+    @sysvar::BMS::SafeStateActive    = 0;
+    @sysvar::BMS::DischargeInhibit   = 1;
+    @sysvar::BMS::ChargeInhibit      = 1;
+    @sysvar::BMS::MainContactorState = 0;
+  }
+  else if (batteryVoltage < 320.0) {
+    batteryState = 1;
+    @sysvar::BMS::DischargeInhibit   = 1;
+    @sysvar::BMS::ChargeInhibit      = 0;
+    @sysvar::BMS::MainContactorState = 3;
+    @sysvar::BMS::SafeStateActive    = 0;
+    @sysvar::Faults::UnderVoltageActive = 1;
+  }
+  else if (packTempMax > 65.0 || @sysvar::Faults::OverTempActive == 1) {
+    batteryState = 4;
+    @sysvar::BMS::DischargeInhibit   = 1;
+    @sysvar::BMS::ChargeInhibit      = 1;
+    @sysvar::BMS::SafeStateActive    = 0;
+    @sysvar::BMS::MainContactorState = 0;
+  }
+  else if (soc >= 99) {
+    batteryState = 6;
+    @sysvar::BMS::SafeStateActive    = 1;
+    @sysvar::BMS::DischargeInhibit   = 0;
+    @sysvar::BMS::ChargeInhibit      = 1;
+    @sysvar::BMS::MainContactorState = 2;
+    @sysvar::Faults::UnderVoltageActive = 0;
+  }
+  else {
+    batteryState = 5;
+    @sysvar::BMS::SafeStateActive    = 1;
+    @sysvar::BMS::DischargeInhibit   = 0;
+    @sysvar::BMS::ChargeInhibit      = 0;
+    @sysvar::BMS::MainContactorState = 2;
+    @sysvar::Faults::UnderVoltageActive = 0;
+  }
+
+  msg.sigBatteryState       = batteryState;
+  msg.sigBatteryVoltage     = batteryVoltage;
+  msg.sigCurrent            = packCurrent;
+  msg.sigLowestCellVoltage  = lowestCellVoltage;
+  msg.sigAlertAnyUnbalanced = alertAnyUnbalanced;
+  msg.sigAlertAnyLowVoltage = alertAnyLowVoltage;
+  msg.sigAlertAnyShortcut   = alertAnyShortcut;
+  msg.sigAlertAnyBypassed   = alertAnyBypassed;
+
+  output(msg);
+  setTimer(tBattState, 200);
+}
+
+/*---------------------------------------------------------------------------
+ * ENVOI LIMITES COURANT (250 ms)
+ *---------------------------------------------------------------------------*/
+on timer tCurrentLimit
+{
+  message frmCurrentLimit msg;
+
+  if (batteryVoltage < 340.0) {
+    drainLimit  = -200;
+    chargeLimit =  100;
+  } else if (packTempMax > 50.0) {
+    drainLimit  = -150;
+    chargeLimit =  50;
+  } else {
+    drainLimit  = -400;
+    chargeLimit =  200;
+  }
+
+  msg.sigDrainLimit  = drainLimit;
+  msg.sigChargeLimit = chargeLimit;
+  output(msg);
+  setTimer(tCurrentLimit, 250);
+}
+
+/*---------------------------------------------------------------------------
+ * ENVOI DONNEES ENERGIE (250 ms)
+ *---------------------------------------------------------------------------*/
+on timer tEnergy
+{
+  message frmEnergy msg;
+  message frmBMSStateEstimation mSOC;
+
+  deltaEnergy = abs(packCurrent) * batteryVoltage * 0.25 / 3600000.0;
+
+  if (packCurrent < 0)       remainingEnergy -= deltaEnergy;
+  else if (packCurrent > 0)  remainingEnergy += deltaEnergy;
+
+  if (remainingEnergy < 0.0)              remainingEnergy = 0.0;
+  if (remainingEnergy > maxEnergyNominal) remainingEnergy = maxEnergyNominal;
+  if (remainingCapacity < 0.0)            remainingCapacity = 0.0;
+
+  soc = (remainingEnergy / maxEnergyNominal) * 100.0;
+  if (soc > 100.0) soc = 100.0;
+  if (soc <   0.0) soc = 0.0;
+
+  batteryVoltage = 300.0 + (soc * 1.2);
+
+  /* Encodage frmEnergy */
+  msg.sigRemainingEnergy   = (long)(remainingEnergy   / 0.0001);
+  msg.sigRemainingCapacity = (long)(remainingCapacity / 0.0001);
+  msg.sigMaxEnergyNominal  = (int) (maxEnergyNominal  / 0.001);
+  output(msg);
+
+  /* frmBMSStateEstimation émis par BMS_Node uniquement pour SOC/SOH
+     SOP laissé à 0 ici — BMS_Controller recalcule et émet ses propres valeurs */
+  mSOC.sigSOC          = (int)soc;
+  mSOC.sigSOH          = (int)soh;
+  mSOC.sigSOPDischarge = 0;   /* BMS_Controller est l'autorité sur la SOP */
+  mSOC.sigSOPCharge    = 0;
+  output(mSOC);
+
+  setTimer(tEnergy, 250);
+}
+
+/*---------------------------------------------------------------------------
+ * REFRESH DU PANEL CANOE (100 ms)
+ * FIX-C : suppression de la double écriture de SOPDischarge
+ * FIX-D : suppression de "packTempMax = @sysvar::Scenario::InjectTemp"
+ *          (géré uniquement par on sysvar Scenario::InjectTemp)
+ *---------------------------------------------------------------------------*/
+on timer tPanelUpdate
+{
+  /* SOPDischarge : NE PAS recalculer ici
+     La valeur est écrite par BMS_Controller dans @sysvar::BMS::SOPDischarge
+     BMS_Node lit simplement les SV pour le panel */
+
+  @sysvar::BMS::SOC          = soc;
+  @sysvar::BMS::SOH          = soh;
+  @sysvar::BMS::PackVoltage  = batteryVoltage;
+  @sysvar::BMS::PackCurrent  = packCurrent;
+  @sysvar::BMS::PackTempMax  = packTempMax;
+  @sysvar::BMS::BatteryState = batteryState;
+
+  /* SOPDischarge déjà mis à jour par BMS_Controller — ne pas écraser */
+
+  setTimer(tPanelUpdate, 100);
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION DES COMMANDES DE MAINTENANCE (BATTDOC)
+ *---------------------------------------------------------------------------*/
+on message frmMaintenance
+{
+  /* Lecture de la valeur physique */
+  targetVoltage = this.sigTargetVoltage.phys;
+
+  balanceActive[0]  = this.sigBalanceBPC_00;
+  balanceActive[1]  = this.sigBalanceBPC_01;
+  balanceActive[2]  = this.sigBalanceBPC_02;
+  balanceActive[3]  = this.sigBalanceBPC_03;
+  balanceActive[4]  = this.sigBalanceBPC_04;
+  balanceActive[5]  = this.sigBalanceBPC_05;
+  balanceActive[6]  = this.sigBalanceBPC_06;
+  balanceActive[7]  = this.sigBalanceBPC_07;
+  balanceActive[8]  = this.sigBalanceBPC_08;
+  balanceActive[9]  = this.sigBalanceBPC_09;
+  balanceActive[10] = this.sigBalanceBPC_10;
+  balanceActive[11] = this.sigBalanceBPC_11;
+  balanceActive[12] = this.sigBalanceBPC_12;
+  balanceActive[13] = this.sigBalanceBPC_13;
+  balanceActive[14] = this.sigBalanceBPC_14;
+  balanceActive[15] = this.sigBalanceBPC_15;
+
+  if (this.sigBypassBPC_00)  bypassActive[0]  = 1;
+  if (this.sigBypassBPC_01)  bypassActive[1]  = 1;
+  if (this.sigBypassBPC_02)  bypassActive[2]  = 1;
+  if (this.sigBypassBPC_03)  bypassActive[3]  = 1;
+  if (this.sigBypassBPC_04)  bypassActive[4]  = 1;
+  if (this.sigBypassBPC_05)  bypassActive[5]  = 1;
+  if (this.sigBypassBPC_06)  bypassActive[6]  = 1;
+  if (this.sigBypassBPC_07)  bypassActive[7]  = 1;
+  if (this.sigBypassBPC_08)  bypassActive[8]  = 1;
+  if (this.sigBypassBPC_09)  bypassActive[9]  = 1;
+  if (this.sigBypassBPC_10)  bypassActive[10] = 1;
+  if (this.sigBypassBPC_11)  bypassActive[11] = 1;
+  if (this.sigBypassBPC_12)  bypassActive[12] = 1;
+  if (this.sigBypassBPC_13)  bypassActive[13] = 1;
+  if (this.sigBypassBPC_14)  bypassActive[14] = 1;
+  if (this.sigBypassBPC_15)  bypassActive[15] = 1;
+
+  write("[BMS] Target Voltage = %.3f V", targetVoltage);
+}
+
+/*---------------------------------------------------------------------------
+ * INTERCEPTION DES ACTIONS DU PANEL
+ *---------------------------------------------------------------------------*/
+on sysvar Scenario::InjectTemp
+{
+  packTempMax = @sysvar::Scenario::InjectTemp;
+  if (packTempMax > 60.0)
+    @sysvar::Faults::OverTempActive = 1;
+  else
+    @sysvar::Faults::OverTempActive = 0;
+  write("[BMS] Temperature injectee = %.1f°C", packTempMax);
+}
+
+on sysvar Scenario::InjectSOC
+{
+  soc = @sysvar::Scenario::InjectSOC;
+  if (soc > 100.0) soc = 100.0;
+  if (soc <   0.0) soc = 0.0;
+  remainingEnergy = (soc / 100.0) * maxEnergyNominal;
+  batteryVoltage  = 300.0 + (soc * 1.2);
+}
+
+on sysvar Scenario::SimulateAging
+{
+  if (@sysvar::Scenario::SimulateAging == 1) {
+    soh              = 72.5;
+    maxEnergyNominal = 72.5;
+    remainingEnergy  = (soc / 100.0) * maxEnergyNominal;
+    write("[BMS Panel] Vieillissement active : SOH=%.1f%%", soh);
+  }
+}
+
+on sysvar Faults::ClearAllFaults
+{
+  int i;
+  if (@sysvar::Faults::ClearAllFaults == 1)
+  {
+    @sysvar::Faults::InjectOverTemp     = 0;
+    @sysvar::Faults::InjectUnderVoltage = 0;
+    @sysvar::Faults::InjectShortCircuit = 0;
+    @sysvar::Faults::InjectOverCurrent  = 0;
+    @sysvar::Faults::InjectInsulation   = 0;
+
+    @sysvar::Faults::OverTempActive     = 0;
+    @sysvar::Faults::UnderVoltageActive = 0;
+    @sysvar::Faults::ShortCircuitActive = 0;
+    @sysvar::Faults::OverCurrentActive  = 0;
+    @sysvar::Faults::InsulationActive   = 0;
+    @sysvar::BMS::DischargeInhibit      = 0;
+    @sysvar::BMS::ChargeInhibit         = 0;
+
+    @sysvar::Scenario::ForceImbalance = -1;
+
+    for (i = 0; i < 16; i++) {
+      cellVoltMin[i]  = 3.60;
+      cellVoltMax[i]  = 3.62;
+      cellPackVolt[i] = 3.61 * 22.0;
+    }
+
+    remainingEnergy = 85.0;
+    soc             = (remainingEnergy / maxEnergyNominal) * 100.0;
+    @sysvar::Scenario::InjectSOC = soc;
+    batteryVoltage  = 300.0 + (soc * 1.2);
+
+    write("[BMS Panel] RAZ de tous les defauts effectuee.");
+    @sysvar::Faults::ClearAllFaults = 0;
+  }
+}
+
+on sysvar Faults::InjectInsulation
+{
+  if (@sysvar::Faults::InjectInsulation == 1) {
+    @sysvar::Faults::InsulationActive = 1;
+    @sysvar::Scenario::StartVehicle = 0;
+    
+    write("[BMS Panel] Defaut d'isolation detecte sur le chassis !");
+  }
+}
+
+on sysvar Scenario::ForceImbalance
+{
+   int idx;
+
+   if (@sysvar::Scenario::ForceImbalance >= 0 &&
+       @sysvar::Scenario::ForceImbalance < 16)
+   {
+      idx = (int)@sysvar::Scenario::ForceImbalance;
+
+      cellVoltMin[idx] = 3.20;
+      cellVoltMax[idx] = 3.65;
+
+      write("[BMS] Desequilibre injecte sur BPC_%02d", idx);
+   }
+}
+on stopMeasurement
+{
+  write("[BMS] Arret de la mesure — cycles effectues : %d", cycleCount);
+}

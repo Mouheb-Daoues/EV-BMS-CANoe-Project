@@ -1,0 +1,121 @@
+/*@!Encoding:1252*/
+/*===========================================================================
+ * FICHIER    : Thermal_System_Node.can
+ * ECU        : Thermal_System
+ * BASE DBC   : BMS_CAN_Database.dbc
+ * DESCRIPTION: Simulation du systeme de refroidissement batterie.
+ *              Recoit les consignes de BMS_Controller et applique
+ *              le refroidissement. Retour d'etat via log.
+ *
+ * MESSAGES RECUS:
+ *   frmThermalControl (ID: 0x10B) depuis BMS_Controller
+ *===========================================================================*/
+
+includes {}
+
+variables
+{
+  /* Etat actuel du systeme thermique */
+  float actualFanSpeed;    /* % vitesse ventilateur appliquee   */
+  float actualPumpSpeed;   /* % vitesse pompe appliquee         */
+  int   thermalModeActive; /* mode thermique en cours           */
+  float currentTemp;       /* temperature actuelle mesuree      */
+  float coolantTemp;       /* temperature liquide de refroid.   */
+
+  /* Statistiques */
+  int   thermalCycles;
+  int   coolingActivations;
+  int   overTempEvents;
+}
+
+on start
+{
+  write("============================================================");
+  write("[THERMAL] Demarrage — Systeme de gestion thermique");
+  write("============================================================");
+
+  actualFanSpeed   = 0.0;
+  actualPumpSpeed  = 20.0;
+  thermalModeActive = 3;  /* IDLE */
+  currentTemp      = 25.0;
+  coolantTemp      = 22.0;
+  thermalCycles    = 0;
+  coolingActivations = 0;
+  overTempEvents   = 0;
+  
+  @sysvar::Thermal::Mode = thermalModeActive;
+
+  write("[THERMAL] Pret — en attente des consignes BMS_Controller");
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmThermalControl  (ID: 0x10B)
+ * Consignes de BMS_Controller — appliquees immediatement
+ *---------------------------------------------------------------------------*/
+on message frmThermalControl
+{
+  float fanReq, pumpReq;
+  int   newMode;
+  float tempRecu;
+
+  fanReq  = this.sigCoolingFanReq;
+  pumpReq = this.sigPumpSpeedReq;
+  newMode = this.sigThermalModeFeedback;
+  thermalModeActive = newMode;
+  @sysvar::Thermal::FeedbackMode = newMode;
+  tempRecu = this.sigActualTemperature;
+
+  thermalCycles++;
+
+  /* Application des consignes */
+  actualFanSpeed  = fanReq;
+  actualPumpSpeed = pumpReq;
+  currentTemp     = tempRecu;
+
+  /* Simulation effet de refroidissement */
+  if (fanReq > 80.0 && pumpReq > 80.0)
+    coolantTemp -= 0.05;
+  else if (fanReq > 0.0)
+    coolantTemp -= 0.02;
+  else
+    coolantTemp += 0.01;
+
+  if (coolantTemp < 15.0) coolantTemp = 15.0;
+  if (coolantTemp > 80.0) coolantTemp = 80.0;
+
+  /* Detection changement de mode */
+  if (newMode != thermalModeActive) {
+    thermalModeActive = newMode;
+    @sysvar::Thermal::Mode = thermalModeActive;
+    switch (newMode) {
+      case 0: write("[THERMAL] Mode : OFF"); break;
+      case 1: write("[THERMAL] Mode : COOLING — Fan=%.0f%% Pump=%.0f%%", fanReq, pumpReq);
+              coolingActivations++; break;
+      case 2: write("[THERMAL] Mode : HEATING"); break;
+      case 3: write("[THERMAL] Mode : IDLE"); break;
+      case 4: write("[THERMAL] Mode : FAULT"); overTempEvents++; break;
+    }
+  }
+
+  /* Log detaille tous les 100 cycles */
+  if ((thermalCycles % 100) == 0) {
+    write("[THERMAL] Temp=%.1fC | Coolant=%.1fC | Fan=%.0f%% | Pump=%.0f%% | Mode=%d",
+          currentTemp, coolantTemp, actualFanSpeed, actualPumpSpeed, thermalModeActive);
+  }
+  write("[RX THERMAL] Temp=%.1f Fan=%.0f Pump=%.0f Mode=%d",
+      tempRecu,
+      fanReq,
+      pumpReq,
+      newMode);
+}
+
+on stopMeasurement
+{
+  write("[THERMAL] Arret — Cycles=%d | Activations refroid.=%d | Evt surchauffe=%d",
+        thermalCycles, coolingActivations, overTempEvents);
+}
+
+
+/*===========================================================================
+ * FIN Thermal_System_Node.can
+ *===========================================================================*/

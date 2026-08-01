@@ -1,0 +1,303 @@
+﻿/*@!Encoding:65001*/
+/*===========================================================================
+ * FICHIER    : BATTDOC_Node.can
+ * ECU        : BATTDOC (Battery Documentation / Maintenance)
+ * BASE DBC   : PowerTrain.dbc
+ *
+ *
+ *===========================================================================*/
+
+includes {}
+
+variables
+{
+  mstimer tMaintenance;
+
+  float vMin[16];
+  float vMax[16];
+  float vPack[16];
+
+  int   alarmUnbal[16];
+  int   alarmLowV[16];
+  int   alarmHighV[16];
+  int   alarmShortcut[16];
+  int   alarmBypassed[16];
+
+  int   nb;
+
+  int   doBalance[16];
+  int   doBypass[16];
+
+  float targetVolt;
+  float targetVoltPerModule[16];
+
+  float SEUIL_DESEQUILIBRE;
+  float SEUIL_SOUS_TENSION;
+  float SEUIL_COURT_CIRCUIT;
+
+  int   globalBattState;
+  int   anyUnbalanced;
+  int   anyLowVoltage;
+  int   anyShortcut;
+
+  int   nbBalancingActif;
+  int   nbBypassActif;
+  int   maintenanceCycles;
+  int   forceBalancingRequest;
+}
+
+/*---------------------------------------------------------------------------
+ * DEMARRAGE
+ *---------------------------------------------------------------------------*/
+on start
+{
+  int i;
+
+  write("============================================================");
+  write("[BATTDOC] Demarrage — Systeme de maintenance cellules");
+  write("============================================================");
+
+  for (i = 0; i < 16; i++) {
+    vMin[i]  = 3.60;
+    vMax[i]  = 3.62;
+    vPack[i] = 79.42;
+    alarmUnbal[i]           = 0;
+    alarmLowV[i]            = 0;
+    alarmHighV[i]           = 0;
+    alarmShortcut[i]        = 0;
+    alarmBypassed[i]        = 0;
+    doBalance[i]            = 0;
+    doBypass[i]             = 0;
+    targetVoltPerModule[i]  = 3.61; /* milieu de la plage nominale */
+  }
+
+  SEUIL_DESEQUILIBRE  = 0.10;
+  SEUIL_SOUS_TENSION  = 3.00;
+  SEUIL_COURT_CIRCUIT = 0.50;
+
+  targetVolt        = 3.61;
+  nbBalancingActif  = 0;
+  nbBypassActif     = 0;
+  maintenanceCycles = 0;
+
+  setTimer(tMaintenance, 100);
+  write("[BATTDOC] Pret — Surveillance des 16 modules BPC active");
+}
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmStateBPC_00 a frmStateBPC_15
+ *---------------------------------------------------------------------------*/
+on message frmStateBPC_00 { vMin[0]  = this.sigCellVoltageMin; vMax[0]  = this.sigCellVoltageMax; vPack[0]  = this.sigCellPackVoltage; analyserModule(0);  }
+on message frmStateBPC_01 { vMin[1]  = this.sigCellVoltageMin; vMax[1]  = this.sigCellVoltageMax; vPack[1]  = this.sigCellPackVoltage; analyserModule(1);  }
+on message frmStateBPC_02 { vMin[2]  = this.sigCellVoltageMin; vMax[2]  = this.sigCellVoltageMax; vPack[2]  = this.sigCellPackVoltage; analyserModule(2);  }
+on message frmStateBPC_03 { vMin[3]  = this.sigCellVoltageMin; vMax[3]  = this.sigCellVoltageMax; vPack[3]  = this.sigCellPackVoltage; analyserModule(3);  }
+on message frmStateBPC_04 { vMin[4]  = this.sigCellVoltageMin; vMax[4]  = this.sigCellVoltageMax; vPack[4]  = this.sigCellPackVoltage; analyserModule(4);  }
+on message frmStateBPC_05{  vMin[5]  = this.sigCellVoltageMin;vMax[5]  =  this.sigCellVoltageMax;vPack[5]   = this.sigCellPackVoltage; analyserModule(5);  }
+on message frmStateBPC_06 { vMin[6]  = this.sigCellVoltageMin; vMax[6]  = this.sigCellVoltageMax; vPack[6]  = this.sigCellPackVoltage; analyserModule(6);  }
+on message frmStateBPC_07 { vMin[7]  = this.sigCellVoltageMin; vMax[7]  = this.sigCellVoltageMax; vPack[7]  = this.sigCellPackVoltage; analyserModule(7);  }
+on message frmStateBPC_08 { vMin[8]  = this.sigCellVoltageMin; vMax[8]  = this.sigCellVoltageMax; vPack[8]  = this.sigCellPackVoltage; analyserModule(8);  }
+on message frmStateBPC_09 { vMin[9]  = this.sigCellVoltageMin; vMax[9]  = this.sigCellVoltageMax; vPack[9]  = this.sigCellPackVoltage; analyserModule(9);  }
+on message frmStateBPC_10 { vMin[10] = this.sigCellVoltageMin; vMax[10] = this.sigCellVoltageMax; vPack[10] = this.sigCellPackVoltage; analyserModule(10); }
+on message frmStateBPC_11 { vMin[11] = this.sigCellVoltageMin; vMax[11] = this.sigCellVoltageMax; vPack[11] = this.sigCellPackVoltage; analyserModule(11); }
+on message frmStateBPC_12 { vMin[12] = this.sigCellVoltageMin; vMax[12] = this.sigCellVoltageMax; vPack[12] = this.sigCellPackVoltage; analyserModule(12); }
+on message frmStateBPC_13 { vMin[13] = this.sigCellVoltageMin; vMax[13] = this.sigCellVoltageMax; vPack[13] = this.sigCellPackVoltage; analyserModule(13); }
+on message frmStateBPC_14 { vMin[14] = this.sigCellVoltageMin; vMax[14] = this.sigCellVoltageMax; vPack[14] = this.sigCellPackVoltage; analyserModule(14); }
+on message frmStateBPC_15 { vMin[15] = this.sigCellVoltageMin; vMax[15] = this.sigCellVoltageMax; vPack[15] = this.sigCellPackVoltage; analyserModule(15); }
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmAlarmsBPC_00 a frmAlarmsBPC_15
+ *---------------------------------------------------------------------------*/
+on message frmAlarmsBPC_00 { alarmUnbal[0] =this.sigAlertUnbalanced; alarmLowV[0] =this.sigAlertLowVoltage; alarmShortcut[0] =this.sigAlertShortcut; alarmBypassed[0] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_01 { alarmUnbal[1] =this.sigAlertUnbalanced; alarmLowV[1] =this.sigAlertLowVoltage; alarmShortcut[1] =this.sigAlertShortcut; alarmBypassed[1] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_02 { alarmUnbal[2] =this.sigAlertUnbalanced; alarmLowV[2] =this.sigAlertLowVoltage; alarmShortcut[2] =this.sigAlertShortcut; alarmBypassed[2] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_03 { alarmUnbal[3] =this.sigAlertUnbalanced; alarmLowV[3] =this.sigAlertLowVoltage; alarmShortcut[3] =this.sigAlertShortcut; alarmBypassed[3] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_04 { alarmUnbal[4] =this.sigAlertUnbalanced; alarmLowV[4] =this.sigAlertLowVoltage; alarmShortcut[4] =this.sigAlertShortcut; alarmBypassed[4] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_05 { alarmUnbal[5] =this.sigAlertUnbalanced; alarmLowV[5] =this.sigAlertLowVoltage; alarmShortcut[5] =this.sigAlertShortcut; alarmBypassed[5] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_06 { alarmUnbal[6] =this.sigAlertUnbalanced; alarmLowV[6] =this.sigAlertLowVoltage; alarmShortcut[6] =this.sigAlertShortcut; alarmBypassed[6] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_07 { alarmUnbal[7] =this.sigAlertUnbalanced; alarmLowV[7] =this.sigAlertLowVoltage; alarmShortcut[7] =this.sigAlertShortcut; alarmBypassed[7] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_08 { alarmUnbal[8] =this.sigAlertUnbalanced; alarmLowV[8] =this.sigAlertLowVoltage; alarmShortcut[8] =this.sigAlertShortcut; alarmBypassed[8] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_09 { alarmUnbal[9] =this.sigAlertUnbalanced; alarmLowV[9] =this.sigAlertLowVoltage; alarmShortcut[9] =this.sigAlertShortcut; alarmBypassed[9] =this.sigAlertBypassed; }
+on message frmAlarmsBPC_10 { alarmUnbal[10]=this.sigAlertUnbalanced; alarmLowV[10]=this.sigAlertLowVoltage; alarmShortcut[10]=this.sigAlertShortcut; alarmBypassed[10]=this.sigAlertBypassed; }
+on message frmAlarmsBPC_11 { alarmUnbal[11]=this.sigAlertUnbalanced; alarmLowV[11]=this.sigAlertLowVoltage; alarmShortcut[11]=this.sigAlertShortcut; alarmBypassed[11]=this.sigAlertBypassed; }
+on message frmAlarmsBPC_12 { alarmUnbal[12]=this.sigAlertUnbalanced; alarmLowV[12]=this.sigAlertLowVoltage; alarmShortcut[12]=this.sigAlertShortcut; alarmBypassed[12]=this.sigAlertBypassed; }
+on message frmAlarmsBPC_13 { alarmUnbal[13]=this.sigAlertUnbalanced; alarmLowV[13]=this.sigAlertLowVoltage; alarmShortcut[13]=this.sigAlertShortcut; alarmBypassed[13]=this.sigAlertBypassed; }
+on message frmAlarmsBPC_14 { alarmUnbal[14]=this.sigAlertUnbalanced; alarmLowV[14]=this.sigAlertLowVoltage; alarmShortcut[14]=this.sigAlertShortcut; alarmBypassed[14]=this.sigAlertBypassed; }
+on message frmAlarmsBPC_15 { alarmUnbal[15]=this.sigAlertUnbalanced; alarmLowV[15]=this.sigAlertLowVoltage; alarmShortcut[15]=this.sigAlertShortcut; alarmBypassed[15]=this.sigAlertBypassed; }
+
+/*---------------------------------------------------------------------------
+ * RECEPTION frmBatteryState  (ID: 0x06)
+ *---------------------------------------------------------------------------*/
+on message frmBatteryState
+{
+  globalBattState = this.sigBatteryState;
+  anyUnbalanced   = this.sigAlertAnyUnbalanced;
+  anyLowVoltage   = this.sigAlertAnyLowVoltage;
+  anyShortcut     = this.sigAlertAnyShortcut;
+
+  /* Mise à jour LED panel — lecture seule, pas de logique de décision ici */
+  @sysvar::Faults::Unbalance = anyUnbalanced;
+
+  if (anyShortcut)
+    write("[BATTDOC] ALERTE CRITIQUE : Court-circuit global detecte !");
+  if (anyUnbalanced)
+    write("[BATTDOC] Desequilibre global signale — analyse en cours via frmStateBPC");
+}
+
+/*---------------------------------------------------------------------------
+ * FONCTION : analyserModule(int idx)
+ *
+ * SEUL point de décision pour le balancing.
+ * Appelée depuis on message frmStateBPC_XX après mise à jour de vMin/vMax.
+ *---------------------------------------------------------------------------*/
+void analyserModule(int idx)
+{
+  int   i;
+  int   encoreActif;
+  float ecart;
+
+  ecart = vMax[idx] - vMin[idx];
+
+  /* ── 1. Court-circuit : bypass immédiat (Priorité Sécurité) ────────── */
+  if (vMin[idx] < SEUIL_COURT_CIRCUIT) {
+    doBypass[idx]  = 1;
+    doBalance[idx] = 0;
+    return;
+  }
+
+  /* ── 2. Sous-tension : bypass ────────────────────────────────────────── */
+  if (vMin[idx] < SEUIL_SOUS_TENSION && alarmLowV[idx]) {
+    doBypass[idx]  = 1;
+    doBalance[idx] = 0;
+    return;
+  }
+
+  /* ── 3. Convergence atteinte : arrêt de l'équilibrage ────────────────── */
+  if (doBalance[idx] == 1 && ecart <= 0.08)
+  {
+    doBalance[idx] = 0;
+    targetVoltPerModule[idx] = 0.0; // Réinitialise la cible locale
+    write("[BATTDOC] Module BPC_%02d équilibré avec succès (écart <= 0.08V) !", idx);
+
+    /* Vérification globale : Est-ce que d'autres modules équilibrent encore ? */
+    encoreActif = 0;
+    for (i = 0; i < 16; i++) {
+      if (doBalance[i]) encoreActif = 1;
+    }
+    
+    if (encoreActif == 0) {
+      @sysvar::Faults::Unbalance = 0; // Éteint le voyant d'alarme sur le Panel
+      write("[BATTDOC] Tous les modules sont maintenant équilibrés.");
+    }
+  }
+}
+
+/*---------------------------------------------------------------------------
+ * EMISSION frmMaintenance  (ID: 0x70)  — 100 ms
+ *---------------------------------------------------------------------------*/
+on timer tMaintenance
+{
+  message frmMaintenance msg;
+  int i;
+
+  maintenanceCycles++;
+  nbBalancingActif = 0;
+  nbBypassActif    = 0;
+
+  for(i=0;i<16;i++)
+  {
+    if(doBalance[i]) nbBalancingActif++;
+    if(doBypass[i])  nbBypassActif++;
+  }
+
+  /* Valeur par défaut */
+  msg.sigTargetVoltage.phys = targetVolt;
+
+  /* Utiliser la cible du premier module en balancing */
+  for(i=0;i<16;i++)
+  {
+    if(doBalance[i])
+    {
+      msg.sigTargetVoltage.phys = targetVoltPerModule[i];
+      break;
+    }
+  }
+
+  msg.sigBypassBPC_00 = doBypass[0];
+  msg.sigBypassBPC_01 = doBypass[1];
+  msg.sigBypassBPC_02 = doBypass[2];
+  msg.sigBypassBPC_03 = doBypass[3];
+  msg.sigBypassBPC_04 = doBypass[4];
+  msg.sigBypassBPC_05 = doBypass[5];
+  msg.sigBypassBPC_06 = doBypass[6];
+  msg.sigBypassBPC_07 = doBypass[7];
+  msg.sigBypassBPC_08 = doBypass[8];
+  msg.sigBypassBPC_09 = doBypass[9];
+  msg.sigBypassBPC_10 = doBypass[10];
+  msg.sigBypassBPC_11 = doBypass[11];
+  msg.sigBypassBPC_12 = doBypass[12];
+  msg.sigBypassBPC_13 = doBypass[13];
+  msg.sigBypassBPC_14 = doBypass[14];
+  msg.sigBypassBPC_15 = doBypass[15];
+
+  msg.sigBalanceBPC_00 = doBalance[0];
+  msg.sigBalanceBPC_01 = doBalance[1];
+  msg.sigBalanceBPC_02 = doBalance[2];
+  msg.sigBalanceBPC_03 = doBalance[3];
+  msg.sigBalanceBPC_04 = doBalance[4];
+  msg.sigBalanceBPC_05 = doBalance[5];
+  msg.sigBalanceBPC_06 = doBalance[6];
+  msg.sigBalanceBPC_07 = doBalance[7];
+  msg.sigBalanceBPC_08 = doBalance[8];
+  msg.sigBalanceBPC_09 = doBalance[9];
+  msg.sigBalanceBPC_10 = doBalance[10];
+  msg.sigBalanceBPC_11 = doBalance[11];
+  msg.sigBalanceBPC_12 = doBalance[12];
+  msg.sigBalanceBPC_13 = doBalance[13];
+  msg.sigBalanceBPC_14 = doBalance[14];
+  msg.sigBalanceBPC_15 = doBalance[15];
+  
+  write(
+"BATTDOC TX : %.2f",
+msg.sigTargetVoltage.phys);
+  output(msg);
+
+  setTimer(tMaintenance,100);
+}
+/*---------------------------------------------------------------------------
+ * BOUTON PANEL : ForceBalancing
+ *---------------------------------------------------------------------------*/
+on sysvar BATTDOC::ForceBalancing // Ajustez avec le nom exact de votre variable de bouton
+{
+  int idx;
+  float ecart;
+
+  if (@sysvar::BATTDOC::ForceBalancing == 1)
+  {
+    write("[BATTDOC] Bouton Battery Balance pressé. Analyse des modules...");
+
+    for (idx = 0; idx < 16; idx++)
+    {
+      ecart = vMax[idx] - vMin[idx];
+
+      // Si le module a un écart significatif (ex: votre module 5 qui a 0.45V d'écart)
+      if (ecart > 0.10)
+      {
+        doBalance[idx] = 1; // On arme l'équilibrage
+        doBypass[idx]  = 0; // On retire tout bypass éventuel
+        
+        // On calcule et on fige la cible médiane à cet instant précis
+        targetVoltPerModule[idx] = (vMin[idx] + vMax[idx]) / 2.0;
+        
+        write("[BATTDOC] -> Module BPC_%02d armé. Cible fixée à %.4fV", idx, targetVoltPerModule[idx]);
+      }
+    }
+    
+    // On relâche automatiquement le bouton du panel pour le rendre à nouveau cliquable 
+  }
+}
+
+on stopMeasurement
+{
+  write("[BATTDOC] Arret — %d cycles | %d balancing | %d bypass",
+        maintenanceCycles, nbBalancingActif, nbBypassActif);
+}
