@@ -152,21 +152,5 @@ EV_BMS_CANoe
 - Battery Management Systems
 - Electric Vehicle Software
 
----
-
-# Internship Information
-
-**Company**
-
-LATIS
-
-**Period**
-
-June 2026
-
-**Project**
-
-Distributed Battery Management System (BMS) Simulation using Vector CANoe.
-
 
 **Mouheb Daoues**
