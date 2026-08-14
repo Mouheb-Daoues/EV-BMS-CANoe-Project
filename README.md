@@ -38,20 +38,6 @@ The objective was to design a realistic embedded automotive simulation while sol
 
 # System Architecture
 
-```
-                           +--------------------+
-                           |        BMS         |
-                           |    Master ECU      |
-                           +---------+----------+
-                                     |
-        ---------------------------------------------------------
-        |                 |                  |                  |
-        |                 |                  |                  |
-+----------------+ +----------------+ +----------------+ +----------------+
-|    BATTDOC     | | Thermal System | |    Charger     | | BMS Controller |
-| Monitoring ECU | |    Cooling     | | Charging ECU   | | Control Logic  |
-+----------------+ +----------------+ +----------------+ +----------------+
-```
 <img width="1536" height="1024" alt="BMS" src="https://github.com/user-attachments/assets/5bf192e3-ebf3-4530-8e8b-ae851d65043e" />
 
 ---
