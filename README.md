@@ -138,6 +138,3 @@ EV_BMS_CANoe
 - Debugging Complex Embedded Systems
 - Battery Management Systems
 - Electric Vehicle Software
-
-
-**Mouheb Daoues**
