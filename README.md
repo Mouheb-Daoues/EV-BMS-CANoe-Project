@@ -114,13 +114,8 @@ EV_BMS_CANoe
 │   ├── PowerTrain.dbc
 │   └── BMS_CAN_Database.dbc
 │
-├── Panels/
+├── dashboard/
 │
-├── Configuration/
-│
-├── Documentation/
-│
-├── Images/
 │
 └── README.md
 ```
