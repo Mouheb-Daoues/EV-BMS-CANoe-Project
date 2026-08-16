@@ -18,7 +18,7 @@ Developed during an engineering internship, the simulation reproduces CAN commun
 
 The objective was to design a realistic embedded automotive simulation while solving several software architecture and CAPL programming challenges.
 
-<img width="1156" height="698" alt="Capture d&#39;écran 2026-07-17 094720" src="https://github.com/user-attachments/assets/0dea2116-84f3-4e0e-a241-1e70f141ceb3" />
+<img width="1920" height="1080" alt="Capture d&#39;écran 2026-07-17 152630" src="https://github.com/user-attachments/assets/bd8d14c6-feb7-4af7-90c0-94ebbf0ed02e" />
 
 ---
 
